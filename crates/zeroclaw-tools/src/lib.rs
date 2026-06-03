@@ -3,7 +3,9 @@
 pub mod microsoft365;
 pub mod util_helpers;
 
+pub mod aidetect;
 pub mod ask_user;
+pub mod get_frame;
 pub mod backup_tool;
 pub mod browser;
 pub mod browser_delegate;

@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/zeroclaw-api", "crates/zeroclaw-infra", "crates/zeroclaw-config", "crates/zeroclaw-providers", "crates/zeroclaw-memory", "crates/zeroclaw-channels", "crates/zeroclaw-tools", "crates/zeroclaw-runtime", "crates/zeroclaw-tui", "crates/zeroclaw-plugins", "crates/zeroclaw-gateway", "crates/zeroclaw-hardware", "crates/zeroclaw-tool-call-parser", "crates/robot-kit", "crates/aardvark-sys", "crates/zeroclaw-macros", "apps/tauri"]
+members = [".", "crates/zeroclaw-api", "crates/zeroclaw-infra", "crates/zeroclaw-config", "crates/zeroclaw-providers", "crates/zeroclaw-memory", "crates/zeroclaw-channels", "crates/zeroclaw-tools", "crates/zeroclaw-runtime", "crates/zeroclaw-tui", "crates/zeroclaw-plugins", "crates/zeroclaw-gateway", "crates/zeroclaw-hardware", "crates/zeroclaw-tool-call-parser", "crates/robot-kit", "crates/aardvark-sys", "crates/zeroclaw-macros", "crates/zeroclaw-prompt-cache", "apps/tauri"]
 resolver = "2"
 
 [workspace.package]
@@ -24,6 +24,7 @@ zeroclaw-gateway = { path = "crates/zeroclaw-gateway", version = "0.7.3" }
 zeroclaw-hardware = { path = "crates/zeroclaw-hardware", version = "0.7.3" }
 zeroclaw-tool-call-parser = { path = "crates/zeroclaw-tool-call-parser", version = "0.7.3" }
 zeroclaw-macros = { path = "crates/zeroclaw-macros", version = "0.7.3" }
+zeroclaw-prompt-cache = { path = "crates/zeroclaw-prompt-cache", version = "0.7.3" }
 aardvark-sys = { path = "crates/aardvark-sys", version = "0.1.0" }
 
 [package]
@@ -77,6 +78,7 @@ zeroclaw-plugins = { workspace = true, optional = true }
 zeroclaw-gateway = { workspace = true, optional = true }
 zeroclaw-hardware = { workspace = true, optional = true }
 zeroclaw-tool-call-parser.workspace = true
+zeroclaw-prompt-cache = { workspace = true, optional = true }
 zeroclaw-macros.workspace = true
 # CLI - minimal and fast
 clap = { version = "4.5", features = ["derive"] }
@@ -240,7 +242,7 @@ default = [
 # The full agent runtime — agent loop, channels, tools, gateway, TUI, all subsystems.
 # Without this, you get the kernel: config + providers + memory + CLI chat.
 agent-runtime = [
-    "dep:zeroclaw-runtime", "dep:zeroclaw-channels", "dep:zeroclaw-tools",
+    "dep:zeroclaw-runtime", "dep:zeroclaw-prompt-cache", "dep:zeroclaw-channels", "dep:zeroclaw-tools",
     "dep:rusqlite",
     "dep:ring", "dep:lru", "dep:chrono-tz", "dep:cron", "dep:glob", "dep:which",
     "dep:ratatui", "dep:crossterm",

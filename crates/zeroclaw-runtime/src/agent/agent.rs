@@ -60,6 +60,10 @@ pub struct Agent {
     /// Hook runner for tool-call auditing and lifecycle side effects.
     /// See issue #5462.
     hook_runner: Option<Arc<crate::hooks::HookRunner>>,
+    /// 三级提示词匹配缓存（PromptCache，Q1 丙方案的 runtime 钩子）。
+    /// 装上后 turn() 在调 provider 之前先 try_match；命中即绕过云端 LLM 直接 dispatch 工具。
+    /// 见 doc/610llama/架构设计/三级提示词匹配机制设计.md 与 三级匹配落地方案选型与权衡.md §3。
+    prompt_cache: Option<Arc<dyn zeroclaw_prompt_cache::PromptCache>>,
 }
 
 pub struct AgentBuilder {
@@ -89,6 +93,7 @@ pub struct AgentBuilder {
     autonomy_level: Option<crate::security::AutonomyLevel>,
     activated_tools: Option<Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
     hook_runner: Option<Arc<crate::hooks::HookRunner>>,
+    prompt_cache: Option<Arc<dyn zeroclaw_prompt_cache::PromptCache>>,
 }
 
 impl Default for AgentBuilder {
@@ -126,6 +131,7 @@ impl AgentBuilder {
             autonomy_level: None,
             activated_tools: None,
             hook_runner: None,
+            prompt_cache: None,
         }
     }
 
@@ -274,6 +280,15 @@ impl AgentBuilder {
         self
     }
 
+    /// 注入三级提示词匹配缓存。装上后 turn() 在调 provider 前先 try_match。
+    pub fn prompt_cache(
+        mut self,
+        cache: Option<Arc<dyn zeroclaw_prompt_cache::PromptCache>>,
+    ) -> Self {
+        self.prompt_cache = cache;
+        self
+    }
+
     pub fn build(self) -> Result<Agent> {
         let mut tools = self
             .tools
@@ -331,8 +346,70 @@ impl AgentBuilder {
                 .unwrap_or(crate::security::AutonomyLevel::Supervised),
             activated_tools: self.activated_tools,
             hook_runner: self.hook_runner,
+            prompt_cache: self.prompt_cache,
         })
     }
+}
+
+/// 按 [PromptCacheConfig] 构建 PromptCache 实例。`enabled=false` 或缺关键字段时返回 `Ok(None)`。
+fn build_prompt_cache(
+    cfg: &zeroclaw_config::schema::PromptCacheConfig,
+    string_match_cfg: &zeroclaw_config::schema::StringMatchConfig,
+) -> Result<Option<Arc<dyn zeroclaw_prompt_cache::PromptCache>>> {
+    if !cfg.enabled {
+        return Ok(None);
+    }
+    let db_path = cfg
+        .db_path
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("prompt_cache.db_path required when enabled"))?;
+    let model_path = cfg
+        .model_path
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("prompt_cache.model_path required when enabled"))?;
+    let model_id = cfg
+        .model_id
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("prompt_cache.model_id required when enabled"))?;
+
+    let pooling = match cfg.pooling.to_ascii_lowercase().as_str() {
+        "cls" => zeroclaw_prompt_cache::LlamaPoolingType::Cls,
+        "mean" => zeroclaw_prompt_cache::LlamaPoolingType::Mean,
+        "last" => zeroclaw_prompt_cache::LlamaPoolingType::Last,
+        "none" => zeroclaw_prompt_cache::LlamaPoolingType::None,
+        other => anyhow::bail!("prompt_cache.pooling: unknown value '{other}'"),
+    };
+
+    let embedder_cfg = zeroclaw_prompt_cache::LlamaEmbedderConfig {
+        model_path: model_path.clone(),
+        model_id: model_id.to_string(),
+        n_ctx: cfg.n_ctx,
+        n_threads: cfg.n_threads,
+        pooling,
+    };
+    let embedder = Arc::new(zeroclaw_prompt_cache::LlamaCppEmbedder::new(embedder_cfg)?);
+
+    let l2 = zeroclaw_prompt_cache::prompt_matcher::L2Thresholds {
+        accept: cfg.accept,
+        reject: cfg.reject,
+    };
+
+    let sm_db_path = zeroclaw_config::policy::expand_user_path(&string_match_cfg.db_path);
+    let sm_engine = if string_match_cfg.enabled {
+        zeroclaw_prompt_cache::StringMatchEngine::init(
+            &sm_db_path,
+            &string_match_cfg.namespace,
+            string_match_cfg.allow_factory_seed,
+        )
+    } else {
+        zeroclaw_prompt_cache::StringMatchEngine::empty()
+    };
+
+    let cache = zeroclaw_prompt_cache::PromptMatcher::open(db_path, model_id, l2)?
+        .with_string_match(sm_engine, &sm_db_path, &string_match_cfg.namespace)
+        .with_embedder(embedder)?;
+
+    Ok(Some(Arc::new(cache)))
 }
 
 impl Agent {
@@ -549,6 +626,10 @@ impl Agent {
         let skills = crate::skills::load_skills_with_config(&config.workspace_dir, config);
         tools::register_skill_tools(&mut tools, &skills, security.clone());
 
+        // 三级提示词匹配缓存：开关 + db + in-process embedder
+        // 见 doc/610llama/架构设计/三级提示词匹配机制设计.md。
+        let prompt_cache = build_prompt_cache(&config.prompt_cache, &config.string_match)?;
+
         Agent::builder()
             .provider(provider)
             .tools(tools)
@@ -579,6 +660,7 @@ impl Agent {
             .security_summary(Some(security.prompt_summary()))
             .autonomy_level(config.autonomy.level)
             .activated_tools(activated_tools)
+            .prompt_cache(prompt_cache)
             .hook_runner(if config.hooks.enabled {
                 let mut runner = crate::hooks::HookRunner::new();
                 if config.hooks.builtin.command_logger {
@@ -825,6 +907,67 @@ impl Agent {
         self.model_name.clone()
     }
 
+    /// PromptCache 命中后的处理：把 prompt + AssistantToolCalls + 工具执行结果
+    /// 都写进 history（保持 trace 完整），把工具结果文本作为 assistant 回复返回。
+    /// 不调 provider，零 token。
+    async fn handle_prompt_cache_hit(
+        &mut self,
+        user_message: &str,
+        m: zeroclaw_prompt_cache::MatchResult,
+    ) -> Result<String> {
+        use crate::agent::dispatcher::ParsedToolCall;
+        use zeroclaw_providers::ToolCall as ApiToolCall;
+
+        // 用户原话进 history（不带 enriched，因为没调 LLM 也就不需要 date/memory 注入）
+        self.history
+            .push(ConversationMessage::Chat(ChatMessage::user(
+                user_message.to_string(),
+            )));
+
+        let id = format!("pc-{}", m.rule_id);
+        let arguments_json = serde_json::to_string(&m.tool_call.args).unwrap_or_else(|_| "{}".into());
+
+        let api_call = ApiToolCall {
+            id: id.clone(),
+            name: m.tool_call.name.clone(),
+            arguments: arguments_json,
+        };
+        let parsed = ParsedToolCall {
+            name: m.tool_call.name.clone(),
+            arguments: m.tool_call.args.clone(),
+            tool_call_id: Some(id),
+        };
+
+        // 合成一条 assistant tool_calls 消息（无 LLM 文本、无 reasoning）
+        self.history.push(ConversationMessage::AssistantToolCalls {
+            text: Some(format!(
+                "[prompt-cache:{:?}] match rule_id={} score={:?}",
+                m.level, m.rule_id, m.score
+            )),
+            tool_calls: vec![api_call],
+            reasoning_content: None,
+        });
+
+        // 走原本 dispatcher 通路
+        let results = self.execute_tools(&[parsed]).await;
+        let formatted = self.tool_dispatcher.format_results(&results);
+        self.history.push(formatted);
+        self.trim_history();
+
+        // §7.4 硬约束：执行失败固定文案，不静默假装成功，不回退到 provider
+        let exec = results
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("execute_tools returned empty result"))?;
+        let response_text = if exec.success {
+            // L1/L2 命中无 LLM 在场：把工具 JSON 输出里的 summary 抽成自然语言再回给
+            // channel（远程），避免把整段 JSON 糊过去。抽不到则原样返回。
+            super::loop_::humanize_cached_output(&exec.output)
+        } else {
+            format!("[prompt-cache] tool '{}' failed: {}", exec.name, exec.output)
+        };
+        Ok(response_text)
+    }
+
     pub async fn turn(&mut self, user_message: &str) -> Result<String> {
         if self.history.is_empty() {
             let system_prompt = self.build_system_prompt()?;
@@ -832,6 +975,15 @@ impl Agent {
                 .push(ConversationMessage::Chat(ChatMessage::system(
                     system_prompt,
                 )));
+        }
+
+        // ===== 三级提示词匹配缓存钩子（Q1 丙）=====
+        // 命中即绕过云端 LLM 直接走 dispatcher，零 token。详见
+        // doc/610llama/架构设计/三级匹配落地方案选型与权衡.md §3 与 §6.
+        if let Some(ref cache) = self.prompt_cache.clone() {
+            if let Some(m) = cache.try_match(user_message).await? {
+                return self.handle_prompt_cache_hit(user_message, m).await;
+            }
         }
 
         let context = self
@@ -1012,6 +1164,33 @@ impl Agent {
                 .push(ConversationMessage::Chat(ChatMessage::system(
                     system_prompt,
                 )));
+        }
+
+        // ===== 三级提示词匹配缓存钩子（与 turn 一致）=====
+        // 命中后没有真正的 streaming 过程，发一条 ToolCall + ToolResult + 整段 Chunk
+        // 模拟一次"瞬时"流，让上游 channel 收得到内容。
+        if let Some(ref cache) = self.prompt_cache.clone() {
+            if let Some(m) = cache.try_match(user_message).await? {
+                let _ = event_tx
+                    .send(TurnEvent::ToolCall {
+                        name: m.tool_call.name.clone(),
+                        args: m.tool_call.args.clone(),
+                    })
+                    .await;
+                let final_text = self.handle_prompt_cache_hit(user_message, m).await?;
+                let _ = event_tx
+                    .send(TurnEvent::ToolResult {
+                        name: "prompt-cache".into(),
+                        output: final_text.clone(),
+                    })
+                    .await;
+                let _ = event_tx
+                    .send(TurnEvent::Chunk {
+                        delta: final_text.clone(),
+                    })
+                    .await;
+                return Ok(final_text);
+            }
         }
 
         let context = self
@@ -1510,6 +1689,107 @@ mod tests {
 
         let response = agent.turn("hi").await.unwrap();
         assert_eq!(response, "hello");
+    }
+
+    /// PromptCache 命中时 provider.chat **绝不被调**（零 token 验证）。
+    /// 直接复用 NativeToolDispatcher + MockTool("echo")，让 cache 命中后走真正的 dispatch 通路。
+    #[tokio::test]
+    async fn prompt_cache_hit_bypasses_provider() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use zeroclaw_prompt_cache::{
+            prompt_matcher::{L2Thresholds, PromptMatcher},
+            PromptCache,
+        };
+
+        // Provider that explodes if called（命中场景下不应到这里）。
+        struct ExplodingProvider {
+            calls: Arc<AtomicUsize>,
+        }
+        #[async_trait]
+        impl Provider for ExplodingProvider {
+            async fn chat_with_system(
+                &self,
+                _: Option<&str>,
+                _: &str,
+                _: &str,
+                _: f64,
+            ) -> Result<String> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                anyhow::bail!("provider should not be called when prompt-cache hits")
+            }
+            async fn chat(
+                &self,
+                _: ChatRequest<'_>,
+                _: &str,
+                _: f64,
+            ) -> Result<zeroclaw_providers::ChatResponse> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                anyhow::bail!("provider should not be called when prompt-cache hits")
+            }
+        }
+
+        // 准备 sqlite + 一条 rule 指向 echo
+        let dir = tempfile::TempDir::new().expect("tmpdir");
+        let db_path = dir.path().join("pc.db");
+        let mut cache =
+            PromptMatcher::open(&db_path, "", L2Thresholds::default()).expect("open");
+        {
+            let conn = cache.raw_conn();
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            conn.execute(
+                "INSERT INTO rules (pattern, tool_name, tool_args, tool_version, created_at, updated_at)
+                 VALUES ('echo me', 'echo', '{}', 'v1', ?1, ?1)",
+                rusqlite::params![now],
+            )
+            .expect("insert rule");
+        }
+        cache.reload().expect("reload");
+        let cache: Arc<dyn PromptCache> = Arc::new(cache);
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = Box::new(ExplodingProvider {
+            calls: calls.clone(),
+        });
+
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation"),
+        );
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+
+        let mut agent = Agent::builder()
+            .provider(provider)
+            .tools(vec![Box::new(MockTool)])
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .prompt_cache(Some(cache))
+            .build()
+            .expect("agent builder");
+
+        let response = agent.turn("echo me").await.expect("turn");
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "provider must NOT be called on prompt-cache hit"
+        );
+        assert_eq!(response, "tool-out", "should return MockTool's output");
+        assert!(
+            agent
+                .history()
+                .iter()
+                .any(|m| matches!(m, ConversationMessage::AssistantToolCalls { .. })),
+            "history should record the synthesized tool call"
+        );
     }
 
     #[tokio::test]

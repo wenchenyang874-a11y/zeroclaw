@@ -441,6 +441,10 @@ pub async fn run_wizard(force: bool, callbacks: WizardCallbacks) -> Result<Confi
         opencode_cli: zeroclaw_config::schema::OpenCodeCliConfig::default(),
         sop: zeroclaw_config::schema::SopConfig::default(),
         shell_tool: zeroclaw_config::schema::ShellToolConfig::default(),
+        prompt_cache: zeroclaw_config::schema::PromptCacheConfig::default(),
+        string_match: zeroclaw_config::schema::StringMatchConfig::default(),
+        aidetect: zeroclaw_config::schema::AidetectConfig::default(),
+        get_frame: zeroclaw_config::schema::GetFrameConfig::default(),
     };
 
     println!(
@@ -920,6 +924,10 @@ async fn run_quick_setup_with_home(
         opencode_cli: zeroclaw_config::schema::OpenCodeCliConfig::default(),
         sop: zeroclaw_config::schema::SopConfig::default(),
         shell_tool: zeroclaw_config::schema::ShellToolConfig::default(),
+        prompt_cache: zeroclaw_config::schema::PromptCacheConfig::default(),
+        string_match: zeroclaw_config::schema::StringMatchConfig::default(),
+        aidetect: zeroclaw_config::schema::AidetectConfig::default(),
+        get_frame: zeroclaw_config::schema::GetFrameConfig::default(),
     };
 
     config.save().await?;

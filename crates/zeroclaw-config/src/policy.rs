@@ -327,7 +327,7 @@ fn home_dir() -> Option<PathBuf> {
     }
 }
 
-fn expand_user_path(path: &str) -> PathBuf {
+pub fn expand_user_path(path: &str) -> PathBuf {
     if path == "~"
         && let Some(home) = home_dir()
     {

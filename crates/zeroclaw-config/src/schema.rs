@@ -452,6 +452,37 @@ pub struct Config {
     #[serde(default)]
     #[nested]
     pub shell_tool: ShellToolConfig,
+
+    /// 三级提示词匹配缓存配置（`[prompt_cache]`）。
+    ///
+    /// 嵌入式 IoT 控制板（Hi3516CV610）上让 L1/L2 本地拦截 prompt，绕过云端
+    /// LLM。配置见 doc/610llama/架构设计/三级提示词匹配机制设计.md。
+    #[serde(default)]
+    #[nested]
+    pub prompt_cache: PromptCacheConfig,
+
+    /// StringMatch L1 快速路径配置（`[string_match]`）。
+    ///
+    /// 正则匹配 → 直调工具，跳过 LLM。规则存 sqlite，namespace 隔离，
+    /// 首次启动自动 seed 工厂规则。移植自 luoqian 的 xxclaw_intension。
+    #[serde(default)]
+    #[nested]
+    pub string_match: StringMatchConfig,
+
+    /// aidetect 工具配置（`[aidetect]`）。
+    ///
+    /// Hi3516CV610 板上 NPU 目标检测：wrapper 把 binary_path/image_path/image_size
+    /// 传给 sample_aidetect。image_path 可被调用参数覆盖（与 get_frame 组合）。
+    #[serde(default)]
+    #[nested]
+    pub aidetect: AidetectConfig,
+
+    /// get_frame 工具配置（`[get_frame]`）。
+    ///
+    /// Hi3516CV610 sensor 抓帧：wrapper 调用 hi3516cv610_get_frame，落盘后返路径。
+    #[serde(default)]
+    #[nested]
+    pub get_frame: GetFrameConfig,
 }
 
 /// Multi-client workspace isolation configuration.
@@ -2957,6 +2988,234 @@ impl Default for ShellToolConfig {
         }
     }
 }
+
+// ── Prompt cache (三级提示词匹配) ─────────────────────────────────
+
+/// 三级提示词匹配缓存配置（`[prompt_cache]` section）。
+///
+/// 设计文档：doc/610llama/架构设计/三级提示词匹配机制设计.md。
+/// 用于嵌入式板（Hi3516CV610）让 L1/L2 在板端拦截 prompt，绕过云端 LLM。
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "prompt-cache"]
+pub struct PromptCacheConfig {
+    /// 是否启用 prompt cache（默认 false，不影响现有部署）。
+    #[serde(default)]
+    pub enabled: bool,
+    /// SQLite 库路径（含规则、向量、pending 学习候选）。
+    /// 例：`/sqlite/data/l2_vector.db`（设计文档 §7 部署布局）。
+    #[serde(default)]
+    pub db_path: Option<std::path::PathBuf>,
+    /// llama.cpp .gguf 模型路径（用于 L2 query embedding）。
+    /// 中文场景用 `bge-small-zh-v1.5-q4_k_m.gguf`，英文用 `all-minilm-l6-v2-q4_k_m.gguf`。
+    #[serde(default)]
+    pub model_path: Option<std::path::PathBuf>,
+    /// 模型 id（与 db 里 `prompt_cache_meta.embedding_model` 比对）。
+    /// 推荐 `<model-name>-<quant>` 格式，例：`bge-small-zh-v1.5-q4_k_m`。
+    #[serde(default)]
+    pub model_id: Option<String>,
+    /// pooling 类型：`cls`（BGE）| `mean`（MiniLM）| `last`。默认 `cls`。
+    #[serde(default = "default_prompt_cache_pooling")]
+    pub pooling: String,
+    /// 上下文窗口（板上 RAM 紧，64 够，宿主机可大）。默认 64。
+    #[serde(default = "default_prompt_cache_n_ctx")]
+    pub n_ctx: u32,
+    /// 推理线程数。Hi3516CV610 双核 A7 用 2。默认 2。
+    #[serde(default = "default_prompt_cache_n_threads")]
+    pub n_threads: i32,
+    /// L2 接受阈值。BGE/CN long 实测 0.66；MiniLM/EN long 实测 0.58。
+    #[serde(default = "default_prompt_cache_accept")]
+    pub accept: f32,
+    /// L2 拒识阈值。BGE/CN 0.54；MiniLM/EN 0.44。灰区 [reject, accept) 走 L3。
+    #[serde(default = "default_prompt_cache_reject")]
+    pub reject: f32,
+
+    /// 自学习闭环开关（默认 false——光跑 L1+L2+L3 mock 不会触发）。
+    #[serde(default)]
+    pub learning_enabled: bool,
+    /// 多少次同样 (prompt, tool_call) 命中 L3 后才送 PromotionWorker 生成 regex。
+    /// 默认 2 —— 单次偶发 prompt 不会污染规则库。
+    #[serde(default = "default_prompt_cache_threshold_n")]
+    pub promote_threshold_n: i64,
+    /// 后台 worker 轮询间隔（秒）。默认 60。
+    #[serde(default = "default_prompt_cache_poll_secs")]
+    pub promote_poll_secs: u64,
+    /// 反悔关键词。下一轮用户输入命中任意一条 → withdraw 上一轮的 pending。
+    /// 默认列表是中文常用词。
+    #[serde(default = "default_prompt_cache_regret_keywords")]
+    pub regret_keywords: Vec<String>,
+}
+
+fn default_prompt_cache_pooling() -> String {
+    "cls".into()
+}
+fn default_prompt_cache_n_ctx() -> u32 {
+    64
+}
+fn default_prompt_cache_n_threads() -> i32 {
+    2
+}
+fn default_prompt_cache_accept() -> f32 {
+    0.66
+}
+fn default_prompt_cache_reject() -> f32 {
+    0.54
+}
+fn default_prompt_cache_threshold_n() -> i64 {
+    2
+}
+fn default_prompt_cache_poll_secs() -> u64 {
+    60
+}
+fn default_prompt_cache_regret_keywords() -> Vec<String> {
+    vec![
+        "不对".into(),
+        "取消".into(),
+        "算了".into(),
+        "不是这个意思".into(),
+        "错了".into(),
+        "不要".into(),
+    ]
+}
+
+impl Default for PromptCacheConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            db_path: None,
+            model_path: None,
+            model_id: None,
+            pooling: default_prompt_cache_pooling(),
+            n_ctx: default_prompt_cache_n_ctx(),
+            n_threads: default_prompt_cache_n_threads(),
+            accept: default_prompt_cache_accept(),
+            reject: default_prompt_cache_reject(),
+            learning_enabled: false,
+            promote_threshold_n: default_prompt_cache_threshold_n(),
+            promote_poll_secs: default_prompt_cache_poll_secs(),
+            regret_keywords: default_prompt_cache_regret_keywords(),
+        }
+    }
+}
+
+// ── StringMatch L1 ───────────────────────────────────────────────────
+
+/// StringMatch L1 快速路径配置（`[string_match]`）。
+///
+/// 规则存 sqlite（独立于 prompt_cache 的 l2_vector.db），namespace 隔离，
+/// 首次启动自动 seed 工厂规则到 system namespace。移植自 xxclaw_intension。
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "string_match"]
+#[serde(default)]
+pub struct StringMatchConfig {
+    /// 主开关。false 时所有输入走 LLM。默认 true。
+    #[serde(default = "default_string_match_enabled")]
+    pub enabled: bool,
+
+    /// 当前进程加载的 namespace。默认 "default"。
+    #[serde(default = "default_string_match_namespace")]
+    pub namespace: String,
+
+    /// SQLite 文件路径（支持 ~ 展开）。默认 "~/.zeroclaw/l1_string_match.db"。
+    #[serde(default = "default_string_match_db_path")]
+    pub db_path: String,
+
+    /// 首次启动时允许 seed 工厂规则到 system namespace。默认 true。
+    #[serde(default = "default_string_match_allow_factory_seed")]
+    pub allow_factory_seed: bool,
+}
+
+impl Default for StringMatchConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_string_match_enabled(),
+            namespace: default_string_match_namespace(),
+            db_path: default_string_match_db_path(),
+            allow_factory_seed: default_string_match_allow_factory_seed(),
+        }
+    }
+}
+
+fn default_string_match_enabled() -> bool { true }
+fn default_string_match_namespace() -> String { "default".to_string() }
+fn default_string_match_db_path() -> String { "~/.zeroclaw/l1_string_match.db".to_string() }
+fn default_string_match_allow_factory_seed() -> bool { true }
+
+/// aidetect 工具配置（Hi3516CV610 板上 NPU 目标检测）。
+///
+/// 测试阶段：image_path 固定一张图，binary_path/models_dir 指向板上部署位置。
+/// 后续支持多图/摄像头时再扩展。
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "aidetect"]
+#[serde(default)]
+pub struct AidetectConfig {
+    /// 主开关。false 时工具注册但 execute 立即返回 disabled。默认 true。
+    #[serde(default = "default_aidetect_enabled")]
+    pub enabled: bool,
+
+    /// sample_aidetect 可执行文件绝对路径。默认 "/tools/aidetect/sample_aidetect"。
+    #[serde(default = "default_aidetect_binary_path")]
+    pub binary_path: String,
+
+    /// NPU 模型 .bin 所在目录。默认 "/tools/aidetect/models"。
+    #[serde(default = "default_aidetect_models_dir")]
+    pub models_dir: String,
+
+    /// 测试图绝对路径。默认 "/tools/aidetect/data/hvf_image_hor_1920x1080.yuv"。
+    #[serde(default = "default_aidetect_image_path")]
+    pub image_path: String,
+
+    /// 测试图分辨率，传给 sample_aidetect 的 -s。默认 "1920x1080"。
+    #[serde(default = "default_aidetect_image_size")]
+    pub image_size: String,
+}
+
+impl Default for AidetectConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_aidetect_enabled(),
+            binary_path: default_aidetect_binary_path(),
+            models_dir: default_aidetect_models_dir(),
+            image_path: default_aidetect_image_path(),
+            image_size: default_aidetect_image_size(),
+        }
+    }
+}
+
+fn default_aidetect_enabled() -> bool { true }
+fn default_aidetect_binary_path() -> String { "/tools/aidetect/sample_aidetect".to_string() }
+fn default_aidetect_models_dir() -> String { "/tools/aidetect/models".to_string() }
+fn default_aidetect_image_path() -> String { "/tools/aidetect/data/hvf_image_hor_1920x1080.yuv".to_string() }
+fn default_aidetect_image_size() -> String { "1920x1080".to_string() }
+
+/// get_frame 工具配置（Hi3516CV610 sensor 抓帧）。
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "get_frame"]
+#[serde(default)]
+pub struct GetFrameConfig {
+    /// 主开关。false 时工具注册但 execute 立即返回 disabled。默认 true。
+    #[serde(default = "default_get_frame_enabled")]
+    pub enabled: bool,
+
+    /// hi3516cv610_get_frame 可执行文件绝对路径。默认 "/tools/get_frame/hi3516cv610_get_frame"。
+    #[serde(default = "default_get_frame_binary_path")]
+    pub binary_path: String,
+}
+
+impl Default for GetFrameConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_get_frame_enabled(),
+            binary_path: default_get_frame_binary_path(),
+        }
+    }
+}
+
+fn default_get_frame_enabled() -> bool { true }
+fn default_get_frame_binary_path() -> String { "/tools/get_frame/hi3516cv610_get_frame".to_string() }
 
 // ── Web search ───────────────────────────────────────────────────
 
@@ -9163,6 +9422,10 @@ impl Default for Config {
             opencode_cli: OpenCodeCliConfig::default(),
             sop: SopConfig::default(),
             shell_tool: ShellToolConfig::default(),
+            prompt_cache: PromptCacheConfig::default(),
+            string_match: StringMatchConfig::default(),
+            aidetect: AidetectConfig::default(),
+            get_frame: GetFrameConfig::default(),
         }
     }
 }
@@ -11776,6 +12039,10 @@ auto_save = true
             opencode_cli: OpenCodeCliConfig::default(),
             sop: SopConfig::default(),
             shell_tool: ShellToolConfig::default(),
+            prompt_cache: PromptCacheConfig::default(),
+            string_match: StringMatchConfig::default(),
+            aidetect: AidetectConfig::default(),
+            get_frame: GetFrameConfig::default(),
         };
         // Provider fields are now resolved directly — no cache needed.
 
@@ -12345,6 +12612,10 @@ default_temperature = 0.7
             opencode_cli: OpenCodeCliConfig::default(),
             sop: SopConfig::default(),
             shell_tool: ShellToolConfig::default(),
+            prompt_cache: PromptCacheConfig::default(),
+            string_match: StringMatchConfig::default(),
+            aidetect: AidetectConfig::default(),
+            get_frame: GetFrameConfig::default(),
         };
 
         // Provider fields are now resolved directly — no cache needed.

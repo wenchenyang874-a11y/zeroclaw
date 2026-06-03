@@ -3480,7 +3480,11 @@ impl Channel for SlackChannel {
         let status_line = text.trim().lines().last().unwrap_or("").trim();
         // Skip "Thinking..." — the typing indicator already conveys that.
         // Only show tool-related progress in the status bar.
-        if status_line.is_empty() || status_line.starts_with("\u{1f914}") {
+        // 兼容旧 🤔 前缀与新 [大模型] 思考标签（CLI 日志改造后思考行用后者）。
+        if status_line.is_empty()
+            || status_line.starts_with("\u{1f914}")
+            || status_line.starts_with("[大模型] 思考")
+        {
             return Ok(());
         }
         self.set_assistant_status(recipient, status_line).await;

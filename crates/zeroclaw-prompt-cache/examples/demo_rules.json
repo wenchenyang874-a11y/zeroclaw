@@ -1,0 +1,165 @@
+[
+  {
+    "pattern": "打开空调",
+    "regex": "(打开|开下|开个|帮.*开|麻烦.*开|能.*开).*?(空调|冷气|AC|ac)|(空调|冷气).*?(打开|开下|开个|帮.*开)",
+    "kind": "Intent",
+    "tool_name": "ac.power",
+    "tool_args": {"action": "on"},
+    "category": "ac",
+    "learnable": true,
+    "priority": 100,
+    "description": "打开空调"
+  },
+  {
+    "pattern": "关闭空调",
+    "regex": "(关闭|关掉|关下|关|帮.*关|麻烦.*关|能.*关).*?(空调|冷气|AC|ac)|(空调|冷气).*?(关闭|关掉|关下|帮.*关)",
+    "kind": "Intent",
+    "tool_name": "ac.power",
+    "tool_args": {"action": "off"},
+    "category": "ac",
+    "learnable": true,
+    "priority": 100,
+    "description": "关闭空调"
+  },
+  {
+    "pattern": "调高空调温度",
+    "regex": "(调高|升高|提高|升|热|太冷).*?(温度|空调)|(空调|温度).*?(调高|升高|提高|高)",
+    "kind": "Intent",
+    "tool_name": "ac.temp_step",
+    "tool_args": {"direction": "up"},
+    "category": "ac",
+    "learnable": true,
+    "priority": 100,
+    "description": "调高空调温度"
+  },
+  {
+    "pattern": "调低空调温度",
+    "regex": "(调低|降低|降|冷|太热).*?(温度|空调)|(空调|温度).*?(调低|降低|低)",
+    "kind": "Intent",
+    "tool_name": "ac.temp_step",
+    "tool_args": {"direction": "down"},
+    "category": "ac",
+    "learnable": true,
+    "priority": 100,
+    "description": "调低空调温度"
+  },
+  {
+    "pattern": "设置空调温度为26度",
+    "kind": "ParameterizedIntent",
+    "tool_name": "ac.set_temp",
+    "tool_args": {"temp": 26},
+    "category": "ac",
+    "learnable": false,
+    "description": "设置空调温度（ParameterizedIntent，L1/L2 跳过，走 L3）"
+  },
+  {
+    "pattern": "打开客厅的灯",
+    "regex": "(打开|开下|开个|开).*?(灯|灯光|照明)|(灯|灯光).*?(打开|开下|开)",
+    "kind": "Intent",
+    "tool_name": "light.power",
+    "tool_args": {"location": "living_room", "action": "on"},
+    "category": "light",
+    "learnable": true,
+    "priority": 100,
+    "description": "打开客厅的灯"
+  },
+  {
+    "pattern": "关闭客厅的灯",
+    "regex": "(关闭|关掉|关).*?(灯|灯光|照明)|(灯|灯光).*?(关闭|关掉|关)",
+    "kind": "Intent",
+    "tool_name": "light.power",
+    "tool_args": {"location": "living_room", "action": "off"},
+    "category": "light",
+    "learnable": true,
+    "priority": 100,
+    "description": "关闭客厅的灯"
+  },
+  {
+    "pattern": "打开卧室的灯",
+    "regex": "(打开|开下|开个|开).*(卧室|房间).*?(灯|灯光)|(卧室|房间).*?(打开|开).*?(灯|灯光)|(灯|灯光).*?(卧室|房间).*?(打开|开)",
+    "kind": "Intent",
+    "tool_name": "light.power",
+    "tool_args": {"location": "bedroom", "action": "on"},
+    "category": "light",
+    "learnable": true,
+    "priority": 100,
+    "description": "打开卧室的灯"
+  },
+  {
+    "pattern": "播放音乐",
+    "regex": "(播放|放|听).*?(音乐|歌|歌曲|声音)|来.*(音乐|歌|歌曲)",
+    "kind": "Intent",
+    "tool_name": "media.play",
+    "tool_args": {},
+    "category": "media",
+    "learnable": true,
+    "priority": 100,
+    "description": "播放音乐"
+  },
+  {
+    "pattern": "暂停音乐",
+    "regex": "(暂停|停|关掉).*?(音乐|歌|播放)|别.*(放|唱)",
+    "kind": "Intent",
+    "tool_name": "media.pause",
+    "tool_args": {},
+    "category": "media",
+    "learnable": true,
+    "priority": 100,
+    "description": "暂停音乐"
+  },
+  {
+    "pattern": "调高音量",
+    "regex": "(调高|加大|升高|提高|开大).*?(音量|声音|声)|音量.*(大|高|增加)",
+    "kind": "Intent",
+    "tool_name": "media.volume_step",
+    "tool_args": {"direction": "up"},
+    "category": "media",
+    "learnable": true,
+    "priority": 100,
+    "description": "调高音量"
+  },
+  {
+    "pattern": "查看今天天气",
+    "regex": "(查|看|查看|看看|今天|现在).*?(天气|气温|温度|下雨|下雪)|天气.*(怎么|如)",
+    "kind": "Intent",
+    "tool_name": "weather.today",
+    "tool_args": {},
+    "category": "weather",
+    "learnable": true,
+    "priority": 100,
+    "description": "查看天气"
+  },
+  {
+    "pattern": "打开窗帘",
+    "regex": "(打开|拉开|开).*?(窗帘|帘)|(窗帘|帘).*?(打开|拉开)",
+    "kind": "Intent",
+    "tool_name": "curtain.power",
+    "tool_args": {"action": "open"},
+    "category": "curtain",
+    "learnable": true,
+    "priority": 100,
+    "description": "打开窗帘"
+  },
+  {
+    "pattern": "关闭窗帘",
+    "regex": "(关闭|拉上|关).*?(窗帘|帘)|(窗帘|帘).*?(关闭|拉上)",
+    "kind": "Intent",
+    "tool_name": "curtain.power",
+    "tool_args": {"action": "close"},
+    "category": "curtain",
+    "learnable": true,
+    "priority": 100,
+    "description": "关闭窗帘"
+  },
+  {
+    "pattern": "查看内存",
+    "regex": "(?i)(?:(?:查|看|查看|显示|show|check|看看)\\s*)?(?:内存|(?:memory|mem)\\b)|^\\s*free\\s*$|/proc/meminfo",
+    "kind": "Intent",
+    "tool_name": "shell",
+    "tool_args": {"command": "cat /proc/meminfo"},
+    "category": "system",
+    "learnable": true,
+    "priority": 100,
+    "description": "查询板子内存使用情况"
+  }
+]

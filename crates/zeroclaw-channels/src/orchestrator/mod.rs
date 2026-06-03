@@ -375,6 +375,9 @@ struct ChannelRuntimeContext {
     max_tool_result_chars: usize,
     context_token_budget: usize,
     debouncer: Arc<zeroclaw_infra::debounce::MessageDebouncer>,
+    /// 三层提示词匹配 + V6 自学习（前端无关组件，与 CLI 共用同一实现）。随 ctx 流到
+    /// dispatch_worker → process_channel_message：命中→零 token dispatch；L3 成功→学习→晋升 L1。
+    prompt_cache_svc: Arc<zeroclaw_runtime::agent::prompt_cache_service::PromptCacheService>,
 }
 
 #[derive(Clone)]
@@ -3015,11 +3018,28 @@ async fn process_channel_message(
             state.prices,
         )
     });
+    // ── 三层提示词匹配（channel 入站）：命中即用 cache 结果替换 LLM（零 token），跳过 LLM 调用 ──
+    // 与 CLI 共用 PromptCacheService：命中→humanize 自然语言；未命中→走下方 run_tool_call_loop。
+    // 放在计时日志之前：L1/L2 命中根本不是 LLM 调用，不应打 "Starting/Completed LLM call"。
+    let cache_hit = ctx
+        .prompt_cache_svc
+        .try_dispatch(&msg.content, ctx.tools_registry.as_ref())
+        .await;
+    let is_cache_hit = cache_hit.is_some();
+    // 仅 L3（未命中且非 override）才收集成功工具调用，供下方 maybe_learn 学习下沉 L1。
+    let learn_collected: std::sync::Mutex<Vec<(String, serde_json::Value)>> =
+        std::sync::Mutex::new(Vec::new());
+    let learn_enabled =
+        cache_hit.is_none() && !ctx.prompt_cache_svc.is_llm_override(&msg.content);
+
     let llm_call_start = Instant::now();
-    #[allow(clippy::cast_possible_truncation)]
-    let elapsed_before_llm_ms = started_at.elapsed().as_millis() as u64;
-    tracing::info!(elapsed_before_llm_ms, "⏱ Starting LLM call");
-    let (llm_result, fallback_info) = scope_provider_fallback(async {
+    let (llm_result, fallback_info) = if let Some(reply) = cache_hit {
+        (LlmExecutionResult::Completed(Ok(Ok(reply))), None)
+    } else {
+        #[allow(clippy::cast_possible_truncation)]
+        let elapsed_before_llm_ms = started_at.elapsed().as_millis() as u64;
+        tracing::info!(elapsed_before_llm_ms, "⏱ Starting LLM call");
+        scope_provider_fallback(async {
         let llm_result = loop {
             let loop_result = tokio::select! {
                 () = cancellation_token.cancelled() => LlmExecutionResult::Cancelled,
@@ -3065,6 +3085,7 @@ async fn process_channel_message(
                         target_channel.as_deref(),
                         None, // receipt_generator
                         None, // collected_receipts
+                        if learn_enabled { Some(&learn_collected) } else { None }, // V6 自学习：仅 L3 路径收集
                     ),
                     ),
                     ),
@@ -3118,7 +3139,15 @@ async fn process_channel_message(
         let fb = take_last_provider_fallback();
         (llm_result, fb)
     })
-    .await;
+    .await
+    };
+
+    // V6 自学习：仅 L3 成功路径学（命中/override 已被 learn_enabled 排除）。策略
+    // （次数!=1 跳过 / record_learning）统一在 PromptCacheService::maybe_learn，与 CLI 一致。
+    if learn_enabled && matches!(&llm_result, LlmExecutionResult::Completed(Ok(Ok(_)))) {
+        let collected = std::mem::take(&mut *learn_collected.lock().unwrap());
+        ctx.prompt_cache_svc.maybe_learn(&msg.content, collected).await;
+    }
 
     // Drop all senders so updater tasks can exit (rx.recv() returns None).
     tracing::debug!("Post-loop: dropping delta_tx and awaiting draft updater");
@@ -3139,11 +3168,14 @@ async fn process_channel_message(
         let _ = handle.await;
     }
 
-    #[allow(clippy::cast_possible_truncation)]
-    let llm_call_ms = llm_call_start.elapsed().as_millis() as u64;
-    #[allow(clippy::cast_possible_truncation)]
-    let total_ms = started_at.elapsed().as_millis() as u64;
-    tracing::info!(llm_call_ms, total_ms, "⏱ LLM call completed");
+    // L1/L2 命中是零 token 的本地 dispatch，不是 LLM 调用——不打 "LLM call completed"。
+    if !is_cache_hit {
+        #[allow(clippy::cast_possible_truncation)]
+        let llm_call_ms = llm_call_start.elapsed().as_millis() as u64;
+        #[allow(clippy::cast_possible_truncation)]
+        let total_ms = started_at.elapsed().as_millis() as u64;
+        tracing::info!(llm_call_ms, total_ms, "⏱ LLM call completed");
+    }
 
     if let Some(token) = typing_cancellation.as_ref() {
         token.cancel();
@@ -5216,6 +5248,26 @@ pub async fn start_channels(config: Config) -> Result<()> {
 
     let tools_registry = Arc::new(built_tools);
 
+    // ── 三层提示词匹配 + V6 自学习（与 CLI 共用 PromptCacheService）──────────
+    // channel/daemon 入站消息也走三层：命中→零 token dispatch；L3 成功→学习→晋升 L1。
+    let prompt_cache_svc = {
+        let mut svc = zeroclaw_runtime::agent::prompt_cache_service::PromptCacheService::from_config(
+            &config.prompt_cache,
+            &config.string_match,
+        )
+        .map_err(|e| anyhow::anyhow!("build prompt cache: {e}"))?;
+        if svc.enabled() && config.prompt_cache.learning_enabled {
+            // worker 复用入站 provider（Arc 共享，provider 为 Send+Sync）。
+            svc.start_promotion_worker(
+                Arc::clone(&provider),
+                model.clone(),
+                config.prompt_cache.promote_poll_secs,
+                config.prompt_cache.promote_threshold_n,
+            );
+        }
+        Arc::new(svc)
+    };
+
     // ── Load locale-aware tool descriptions ────────────────────────
     let i18n_locale = config
         .locale
@@ -5571,6 +5623,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         pacing: config.pacing.clone(),
         max_tool_result_chars: config.agent.max_tool_result_chars,
         context_token_budget: config.agent.max_context_tokens,
+        prompt_cache_svc: Arc::clone(&prompt_cache_svc),
         debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
             Duration::from_millis(config.channels.debounce_ms),
         )),
@@ -6110,6 +6163,7 @@ mod tests {
             pacing: zeroclaw_config::schema::PacingConfig::default(),
             max_tool_result_chars: 0,
             context_token_budget: 0,
+            prompt_cache_svc: std::sync::Arc::new(zeroclaw_runtime::agent::prompt_cache_service::PromptCacheService::disabled()),
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
@@ -6236,6 +6290,7 @@ mod tests {
             pacing: zeroclaw_config::schema::PacingConfig::default(),
             max_tool_result_chars: 0,
             context_token_budget: 0,
+            prompt_cache_svc: std::sync::Arc::new(zeroclaw_runtime::agent::prompt_cache_service::PromptCacheService::disabled()),
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
@@ -6319,6 +6374,7 @@ mod tests {
             pacing: zeroclaw_config::schema::PacingConfig::default(),
             max_tool_result_chars: 0,
             context_token_budget: 0,
+            prompt_cache_svc: std::sync::Arc::new(zeroclaw_runtime::agent::prompt_cache_service::PromptCacheService::disabled()),
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
@@ -6419,6 +6475,7 @@ mod tests {
             pacing: zeroclaw_config::schema::PacingConfig::default(),
             max_tool_result_chars: 0,
             context_token_budget: 0,
+            prompt_cache_svc: std::sync::Arc::new(zeroclaw_runtime::agent::prompt_cache_service::PromptCacheService::disabled()),
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
@@ -7020,6 +7077,7 @@ BTC is currently around $65,000 based on latest tool output."#
             pacing: zeroclaw_config::schema::PacingConfig::default(),
             max_tool_result_chars: 0,
             context_token_budget: 0,
+            prompt_cache_svc: std::sync::Arc::new(zeroclaw_runtime::agent::prompt_cache_service::PromptCacheService::disabled()),
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
@@ -7112,6 +7170,7 @@ BTC is currently around $65,000 based on latest tool output."#
             pacing: zeroclaw_config::schema::PacingConfig::default(),
             max_tool_result_chars: 0,
             context_token_budget: 0,
+            prompt_cache_svc: std::sync::Arc::new(zeroclaw_runtime::agent::prompt_cache_service::PromptCacheService::disabled()),
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
@@ -7218,6 +7277,7 @@ BTC is currently around $65,000 based on latest tool output."#
             pacing: zeroclaw_config::schema::PacingConfig::default(),
             max_tool_result_chars: 0,
             context_token_budget: 0,
+            prompt_cache_svc: std::sync::Arc::new(zeroclaw_runtime::agent::prompt_cache_service::PromptCacheService::disabled()),
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
@@ -7309,6 +7369,7 @@ BTC is currently around $65,000 based on latest tool output."#
             pacing: zeroclaw_config::schema::PacingConfig::default(),
             max_tool_result_chars: 0,
             context_token_budget: 0,
+            prompt_cache_svc: std::sync::Arc::new(zeroclaw_runtime::agent::prompt_cache_service::PromptCacheService::disabled()),
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
@@ -7410,6 +7471,7 @@ BTC is currently around $65,000 based on latest tool output."#
             pacing: zeroclaw_config::schema::PacingConfig::default(),
             max_tool_result_chars: 0,
             context_token_budget: 0,
+            prompt_cache_svc: std::sync::Arc::new(zeroclaw_runtime::agent::prompt_cache_service::PromptCacheService::disabled()),
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
@@ -7532,6 +7594,7 @@ BTC is currently around $65,000 based on latest tool output."#
             pacing: zeroclaw_config::schema::PacingConfig::default(),
             max_tool_result_chars: 0,
             context_token_budget: 0,
+            prompt_cache_svc: std::sync::Arc::new(zeroclaw_runtime::agent::prompt_cache_service::PromptCacheService::disabled()),
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
@@ -7635,6 +7698,7 @@ BTC is currently around $65,000 based on latest tool output."#
             pacing: zeroclaw_config::schema::PacingConfig::default(),
             max_tool_result_chars: 0,
             context_token_budget: 0,
+            prompt_cache_svc: std::sync::Arc::new(zeroclaw_runtime::agent::prompt_cache_service::PromptCacheService::disabled()),
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
@@ -7753,6 +7817,7 @@ BTC is currently around $65,000 based on latest tool output."#
             pacing: zeroclaw_config::schema::PacingConfig::default(),
             max_tool_result_chars: 0,
             context_token_budget: 0,
+            prompt_cache_svc: std::sync::Arc::new(zeroclaw_runtime::agent::prompt_cache_service::PromptCacheService::disabled()),
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
@@ -7859,6 +7924,7 @@ BTC is currently around $65,000 based on latest tool output."#
             },
             max_tool_result_chars: 0,
             context_token_budget: 0,
+            prompt_cache_svc: std::sync::Arc::new(zeroclaw_runtime::agent::prompt_cache_service::PromptCacheService::disabled()),
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
@@ -7955,6 +8021,7 @@ BTC is currently around $65,000 based on latest tool output."#
             },
             max_tool_result_chars: 0,
             context_token_budget: 0,
+            prompt_cache_svc: std::sync::Arc::new(zeroclaw_runtime::agent::prompt_cache_service::PromptCacheService::disabled()),
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
@@ -8174,6 +8241,7 @@ BTC is currently around $65,000 based on latest tool output."#
             pacing: zeroclaw_config::schema::PacingConfig::default(),
             max_tool_result_chars: 0,
             context_token_budget: 0,
+            prompt_cache_svc: std::sync::Arc::new(zeroclaw_runtime::agent::prompt_cache_service::PromptCacheService::disabled()),
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
@@ -8288,6 +8356,7 @@ BTC is currently around $65,000 based on latest tool output."#
             pacing: zeroclaw_config::schema::PacingConfig::default(),
             max_tool_result_chars: 0,
             context_token_budget: 0,
+            prompt_cache_svc: std::sync::Arc::new(zeroclaw_runtime::agent::prompt_cache_service::PromptCacheService::disabled()),
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
@@ -8421,6 +8490,7 @@ BTC is currently around $65,000 based on latest tool output."#
             pacing: zeroclaw_config::schema::PacingConfig::default(),
             max_tool_result_chars: 0,
             context_token_budget: 0,
+            prompt_cache_svc: std::sync::Arc::new(zeroclaw_runtime::agent::prompt_cache_service::PromptCacheService::disabled()),
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
@@ -8551,6 +8621,7 @@ BTC is currently around $65,000 based on latest tool output."#
             pacing: zeroclaw_config::schema::PacingConfig::default(),
             max_tool_result_chars: 0,
             context_token_budget: 0,
+            prompt_cache_svc: std::sync::Arc::new(zeroclaw_runtime::agent::prompt_cache_service::PromptCacheService::disabled()),
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
@@ -8659,6 +8730,7 @@ BTC is currently around $65,000 based on latest tool output."#
             pacing: zeroclaw_config::schema::PacingConfig::default(),
             max_tool_result_chars: 0,
             context_token_budget: 0,
+            prompt_cache_svc: std::sync::Arc::new(zeroclaw_runtime::agent::prompt_cache_service::PromptCacheService::disabled()),
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
@@ -8748,6 +8820,7 @@ BTC is currently around $65,000 based on latest tool output."#
             pacing: zeroclaw_config::schema::PacingConfig::default(),
             max_tool_result_chars: 0,
             context_token_budget: 0,
+            prompt_cache_svc: std::sync::Arc::new(zeroclaw_runtime::agent::prompt_cache_service::PromptCacheService::disabled()),
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
@@ -8837,6 +8910,7 @@ BTC is currently around $65,000 based on latest tool output."#
             pacing: zeroclaw_config::schema::PacingConfig::default(),
             max_tool_result_chars: 0,
             context_token_budget: 0,
+            prompt_cache_svc: std::sync::Arc::new(zeroclaw_runtime::agent::prompt_cache_service::PromptCacheService::disabled()),
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
@@ -9632,6 +9706,7 @@ BTC is currently around $65,000 based on latest tool output."#
             pacing: zeroclaw_config::schema::PacingConfig::default(),
             max_tool_result_chars: 0,
             context_token_budget: 0,
+            prompt_cache_svc: std::sync::Arc::new(zeroclaw_runtime::agent::prompt_cache_service::PromptCacheService::disabled()),
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
@@ -9778,6 +9853,7 @@ BTC is currently around $65,000 based on latest tool output."#
             pacing: zeroclaw_config::schema::PacingConfig::default(),
             max_tool_result_chars: 0,
             context_token_budget: 0,
+            prompt_cache_svc: std::sync::Arc::new(zeroclaw_runtime::agent::prompt_cache_service::PromptCacheService::disabled()),
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
@@ -9965,6 +10041,7 @@ BTC is currently around $65,000 based on latest tool output."#
             pacing: zeroclaw_config::schema::PacingConfig::default(),
             max_tool_result_chars: 0,
             context_token_budget: 0,
+            prompt_cache_svc: std::sync::Arc::new(zeroclaw_runtime::agent::prompt_cache_service::PromptCacheService::disabled()),
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
@@ -10083,6 +10160,7 @@ BTC is currently around $65,000 based on latest tool output."#
             pacing: zeroclaw_config::schema::PacingConfig::default(),
             max_tool_result_chars: 0,
             context_token_budget: 0,
+            prompt_cache_svc: std::sync::Arc::new(zeroclaw_runtime::agent::prompt_cache_service::PromptCacheService::disabled()),
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
@@ -10707,6 +10785,7 @@ This is an example JSON object for profile settings."#;
             pacing: zeroclaw_config::schema::PacingConfig::default(),
             max_tool_result_chars: 0,
             context_token_budget: 0,
+            prompt_cache_svc: std::sync::Arc::new(zeroclaw_runtime::agent::prompt_cache_service::PromptCacheService::disabled()),
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
@@ -10805,6 +10884,7 @@ This is an example JSON object for profile settings."#;
             pacing: zeroclaw_config::schema::PacingConfig::default(),
             max_tool_result_chars: 0,
             context_token_budget: 0,
+            prompt_cache_svc: std::sync::Arc::new(zeroclaw_runtime::agent::prompt_cache_service::PromptCacheService::disabled()),
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
@@ -10935,6 +11015,7 @@ This is an example JSON object for profile settings."#;
             pacing: zeroclaw_config::schema::PacingConfig::default(),
             max_tool_result_chars: 50000,
             context_token_budget: 128_000,
+            prompt_cache_svc: std::sync::Arc::new(zeroclaw_runtime::agent::prompt_cache_service::PromptCacheService::disabled()),
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 std::time::Duration::ZERO,
             )),
@@ -11113,6 +11194,7 @@ This is an example JSON object for profile settings."#;
             pacing: zeroclaw_config::schema::PacingConfig::default(),
             max_tool_result_chars: 0,
             context_token_budget: 0,
+            prompt_cache_svc: std::sync::Arc::new(zeroclaw_runtime::agent::prompt_cache_service::PromptCacheService::disabled()),
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
@@ -11235,6 +11317,7 @@ This is an example JSON object for profile settings."#;
             pacing: zeroclaw_config::schema::PacingConfig::default(),
             max_tool_result_chars: 0,
             context_token_budget: 0,
+            prompt_cache_svc: std::sync::Arc::new(zeroclaw_runtime::agent::prompt_cache_service::PromptCacheService::disabled()),
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
@@ -11349,6 +11432,7 @@ This is an example JSON object for profile settings."#;
             pacing: zeroclaw_config::schema::PacingConfig::default(),
             max_tool_result_chars: 0,
             context_token_budget: 0,
+            prompt_cache_svc: std::sync::Arc::new(zeroclaw_runtime::agent::prompt_cache_service::PromptCacheService::disabled()),
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
@@ -11483,6 +11567,7 @@ This is an example JSON object for profile settings."#;
             pacing: zeroclaw_config::schema::PacingConfig::default(),
             max_tool_result_chars: 0,
             context_token_budget: 0,
+            prompt_cache_svc: std::sync::Arc::new(zeroclaw_runtime::agent::prompt_cache_service::PromptCacheService::disabled()),
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
@@ -11799,6 +11884,7 @@ This is an example JSON object for profile settings."#;
             pacing: zeroclaw_config::schema::PacingConfig::default(),
             max_tool_result_chars: 0,
             context_token_budget: 0,
+            prompt_cache_svc: std::sync::Arc::new(zeroclaw_runtime::agent::prompt_cache_service::PromptCacheService::disabled()),
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),

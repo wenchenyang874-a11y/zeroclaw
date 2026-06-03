@@ -12,6 +12,7 @@ zeroclaw-infra.workspace = true
 zeroclaw-config.workspace = true
 zeroclaw-providers.workspace = true
 zeroclaw-memory.workspace = true
+zeroclaw-prompt-cache.workspace = true
 zeroclaw-tools.workspace = true
 zeroclaw-plugins = { workspace = true, optional = true }
 zeroclaw-tool-call-parser.workspace = true
@@ -104,6 +105,7 @@ sandbox-bubblewrap = []
 [dev-dependencies]
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
 rcgen = "0.13"
+rusqlite = { version = "0.37", features = ["bundled"] }
 tempfile = "3.26"
 tokio = { version = "1.50", features = ["rt-multi-thread", "macros"] }
 scopeguard = "1.2"

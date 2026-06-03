@@ -196,6 +196,11 @@ struct Cli {
     #[arg(long, global = true)]
     config_dir: Option<String>,
 
+    /// 开启 DEBUG 级日志（等价 RUST_LOG=debug，但压住 matrix/hyper/reqwest 等噪声）。
+    /// 例：`zeroclaw agent --debug`。RUST_LOG 环境变量若已设则优先于此 flag。
+    #[arg(short = 'd', long, global = true)]
+    debug: bool,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -417,6 +422,23 @@ Examples:
     Cron {
         #[command(subcommand)]
         cron_command: CronCommands,
+    },
+
+    /// Manage L1 string-match rules (regex → direct tool)
+    #[command(long_about = "\
+Manage L1 string-match rules stored in l1_string_match.db.
+Rules are regex patterns that trigger direct tool calls, skipping the LLM.
+Changes require restarting zeroclaw to take effect.
+
+Examples:
+  zeroclaw l1 list
+  zeroclaw l1 list --namespace system
+  zeroclaw l1 add --name ac_on --pattern '(打开|开下).*空调' --tool ac.power --args '{}'
+  zeroclaw l1 disable --name ac_on
+  zeroclaw l1 remove --name ac_on")]
+    L1 {
+        #[command(subcommand)]
+        l1_command: L1Commands,
     },
 
     /// Manage provider model catalogs
@@ -871,6 +893,63 @@ enum ModelCommands {
 }
 
 #[derive(Subcommand, Debug)]
+enum L1Commands {
+    /// List all rules (active namespace + 'system' shown by default)
+    List {
+        #[arg(long)]
+        namespace: Option<String>,
+        #[arg(long)]
+        db: Option<PathBuf>,
+    },
+    /// Add a new rule (cannot add to 'system' namespace)
+    Add {
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        pattern: String,
+        #[arg(long)]
+        tool: String,
+        #[arg(long)]
+        args: String,
+        #[arg(long)]
+        description: Option<String>,
+        #[arg(long)]
+        priority: Option<i64>,
+        #[arg(long)]
+        namespace: Option<String>,
+        #[arg(long)]
+        db: Option<PathBuf>,
+    },
+    /// Remove a rule by name (cannot remove from 'system')
+    Remove {
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        namespace: Option<String>,
+        #[arg(long)]
+        db: Option<PathBuf>,
+    },
+    /// Enable a previously-disabled rule
+    Enable {
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        namespace: Option<String>,
+        #[arg(long)]
+        db: Option<PathBuf>,
+    },
+    /// Disable a rule without deleting it
+    Disable {
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        namespace: Option<String>,
+        #[arg(long)]
+        db: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
 enum DoctorCommands {
     /// Probe model catalogs across providers and report availability
     Models {
@@ -962,14 +1041,23 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    // Initialize logging - respects RUST_LOG env var, defaults to INFO.
+    // Initialize logging - respects RUST_LOG env var, else uses --debug flag.
     // matrix_sdk crates are suppressed to warn because they are extremely
     // noisy at info level. To restore SDK-level output for Matrix debugging:
     //   RUST_LOG=info,matrix_sdk=info,matrix_sdk_base=info,matrix_sdk_crypto=info
+    //
+    // --debug 开 DEBUG 级（仍压住 matrix/hyper/reqwest/h2/rustls 等第三方噪声），
+    // 方便看 tracing::debug! 诊断日志；不加 --debug 时默认 INFO。
+    let default_filter = if cli.debug {
+        "debug,matrix_sdk=warn,matrix_sdk_base=warn,matrix_sdk_crypto=warn,\
+         hyper=info,reqwest=info,h2=info,rustls=info,tokio_util=info"
+    } else {
+        "info,matrix_sdk=warn,matrix_sdk_base=warn,matrix_sdk_crypto=warn"
+    };
     let subscriber = fmt::Subscriber::builder()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-            EnvFilter::new("info,matrix_sdk=warn,matrix_sdk_base=warn,matrix_sdk_crypto=warn")
-        }))
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_filter)),
+        )
         .finish();
 
     tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");
@@ -1599,6 +1687,24 @@ async fn main() -> Result<()> {
             domains,
             tools,
         } => handle_estop_command(&config, estop_command, level, domains, tools),
+
+        Commands::L1 { l1_command } => match l1_command {
+            L1Commands::List { namespace, db } => {
+                commands::l1::handle_list(&config.string_match, namespace, db)
+            }
+            L1Commands::Add { name, pattern, tool, args, description, priority, namespace, db } => {
+                commands::l1::handle_add(&config.string_match, name, pattern, tool, args, description, priority, namespace, db)
+            }
+            L1Commands::Remove { name, namespace, db } => {
+                commands::l1::handle_remove(&config.string_match, name, namespace, db)
+            }
+            L1Commands::Enable { name, namespace, db } => {
+                commands::l1::handle_set_enabled(&config.string_match, name, true, namespace, db)
+            }
+            L1Commands::Disable { name, namespace, db } => {
+                commands::l1::handle_set_enabled(&config.string_match, name, false, namespace, db)
+            }
+        },
 
         Commands::Cron { cron_command } => cron::handle_command(cron_command, &config),
 

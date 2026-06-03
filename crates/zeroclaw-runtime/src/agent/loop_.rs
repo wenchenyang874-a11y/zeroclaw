@@ -105,6 +105,45 @@ pub fn clear_model_switch_request() {
     }
 }
 
+
+/// 三级提示词匹配钩子：在调 provider 之前先问 prompt-cache。
+/// 命中即直接 dispatch 工具，不走云端，零 token。返回 Some 表示已处理。
+/// L1/L2 命中（零 token、无 LLM 在场）时，把工具输出里的人类可读 `summary` 抽出来当回复，
+/// 避免把整段 JSON 糊给用户。识别两种形态：
+///   - 工具直接返回 `{..., "summary": "..."}`（如 aidetect 工具）；
+///   - execute_pipeline 返回 `[{tool, output:"{...summary...}"}, ...]`（每步 output 是 JSON 串），
+///     逐步抽出各自的 summary 拼接。
+/// 抽不到任何 summary 就原样返回（不破坏非检测类工具的输出，如 shell/天气）。
+/// CLI REPL（本文件）与 channel/Agent::turn（agent.rs handle_prompt_cache_hit）共用，
+/// 保证远程 channel 命中 L1/L2 时也收到自然语言 summary，而非整段 JSON。
+pub(crate) fn humanize_cached_output(raw: &str) -> String {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return raw.to_string();
+    };
+    // 单工具：顶层就有 summary。
+    if let Some(s) = v.get("summary").and_then(|s| s.as_str()) {
+        return s.to_string();
+    }
+    // execute_pipeline：StepResult 数组，每步 output 是 JSON 串，逐步取其 summary。
+    if let Some(arr) = v.as_array() {
+        let summaries: Vec<String> = arr
+            .iter()
+            .filter_map(|step| {
+                let out = step.get("output")?.as_str()?;
+                let inner: serde_json::Value = serde_json::from_str(out).ok()?;
+                inner.get("summary")?.as_str().map(str::to_string)
+            })
+            .collect();
+        if !summaries.is_empty() {
+            return summaries.join("\n");
+        }
+    }
+    raw.to_string()
+}
+
+// 三层匹配的 dispatch / build / 学习逻辑已迁至 agent::prompt_cache_service::PromptCacheService
+// （前端无关，CLI/channel/ACP 共用）。本文件只通过 PromptCacheService 使用它们。
+
 fn glob_match(pattern: &str, name: &str) -> bool {
     match pattern.find('*') {
         None => pattern == name,
@@ -680,6 +719,7 @@ pub async fn agent_turn(
         channel,
         None, // receipt_generator
         None, // collected_receipts
+        None, // successful_tool_calls (V6)
     )
     .await
 }
@@ -847,6 +887,9 @@ pub async fn run_tool_call_loop(
     channel: Option<&dyn Channel>,
     receipt_generator: Option<&crate::agent::tool_receipts::ReceiptGenerator>,
     collected_receipts: Option<&std::sync::Mutex<Vec<String>>>,
+    // 只收集**执行成功**的 (tool_name, args)，供 V6 自学习用。
+    // 失败的工具调用（如 screenshot 报错）不进来，不会被学进 pending_rules。
+    successful_tool_calls: Option<&std::sync::Mutex<Vec<(String, serde_json::Value)>>>,
 ) -> Result<String> {
     let max_iterations = if max_tool_iterations == 0 {
         DEFAULT_MAX_TOOL_ITERATIONS
@@ -1028,9 +1071,9 @@ pub async fn run_tool_call_loop(
         // ── Progress: LLM thinking ────────────────────────────
         if let Some(ref tx) = on_delta {
             let phase = if iteration == 0 {
-                "\u{1f914} Thinking...\n".to_string()
+                "[大模型] 思考中…\n".to_string()
             } else {
-                format!("\u{1f914} Thinking (round {})...\n", iteration + 1)
+                format!("[大模型] 思考中（第 {} 轮）…\n", iteration + 1)
             };
             let _ = tx.send(StreamDelta::Status(phase)).await;
         }
@@ -1402,11 +1445,28 @@ pub async fn run_tool_call_loop(
             if !tool_calls.is_empty() {
                 let _ = tx
                     .send(StreamDelta::Status(format!(
-                        "\u{1f4ac} Got {} tool call(s) ({llm_secs}s)\n",
+                        "[大模型] 下发 {} 个工具调用（{llm_secs}s）\n",
                         tool_calls.len()
                     )))
                     .await;
             }
+        }
+
+        // ── DEBUG: 云端下发的 tool 调用（name + args），仅 --debug 可见 ──
+        if !tool_calls.is_empty() {
+            use std::fmt::Write as _;
+            let mut s = format!("[大模型·DEBUG] 下发 {} 个工具调用", tool_calls.len());
+            for (i, c) in tool_calls.iter().enumerate() {
+                let args = serde_json::to_string(&c.arguments).unwrap_or_default();
+                let _ = write!(
+                    s,
+                    "\n   {}. {}  {}",
+                    i + 1,
+                    c.name,
+                    truncate_with_ellipsis(&args, 300)
+                );
+            }
+            tracing::debug!("{s}");
         }
 
         if tool_calls.is_empty() {
@@ -1524,7 +1584,7 @@ pub async fn run_tool_call_loop(
                         if let Some(ref tx) = on_delta {
                             let _ = tx
                                 .send(StreamDelta::Status(format!(
-                                    "\u{274c} {}: {}\n",
+                                    "[执行✗] {}: {}\n",
                                     call.name,
                                     truncate_with_ellipsis(&scrub_credentials(&cancelled), 200)
                                 )))
@@ -1626,7 +1686,7 @@ pub async fn run_tool_call_loop(
                     if let Some(ref tx) = on_delta {
                         let _ = tx
                             .send(StreamDelta::Status(format!(
-                                "\u{274c} {}: {}\n",
+                                "[执行✗] {}: {}\n",
                                 tool_name, denied
                             )))
                             .await;
@@ -1675,7 +1735,7 @@ pub async fn run_tool_call_loop(
                 if let Some(ref tx) = on_delta {
                     let _ = tx
                         .send(StreamDelta::Status(format!(
-                            "\u{274c} {}: {}\n",
+                            "[执行✗] {}: {}\n",
                             tool_name, duplicate
                         )))
                         .await;
@@ -1723,14 +1783,16 @@ pub async fn run_tool_call_loop(
                             .or_else(|| tool_args.get("query").and_then(|v| v.as_str())),
                     };
                     match raw {
-                        Some(s) => truncate_with_ellipsis(s, 60),
+                        // 200 而非 60：shell 组合命令（get_frame && aidetect && rm）较长，
+                        // 截到 60 只能看到第一段，会误以为只跑了抓帧。放宽到能看全整条。
+                        Some(s) => truncate_with_ellipsis(s, 200),
                         None => String::new(),
                     }
                 };
                 let progress = if hint.is_empty() {
-                    format!("\u{23f3} {}\n", tool_name)
+                    format!("[执行] {}\n", tool_name)
                 } else {
-                    format!("\u{23f3} {}: {hint}\n", tool_name)
+                    format!("[执行] {}: {hint}\n", tool_name)
                 };
                 tracing::debug!(tool = %tool_name, "Sending progress start to draft");
                 let _ = tx.send(StreamDelta::Status(progress)).await;
@@ -1787,6 +1849,14 @@ pub async fn run_tool_call_loop(
                 }),
             );
 
+            // ── V6 自学习：只记成功的工具调用 ─────────────────
+            if outcome.success
+                && let Some(collector) = successful_tool_calls
+                && let Ok(mut v) = collector.lock()
+            {
+                v.push((call.name.clone(), call.arguments.clone()));
+            }
+
             // ── Hook: after_tool_call (void) ─────────────────
             if let Some(hooks) = hooks {
                 let tool_result_obj = crate::tools::ToolResult {
@@ -1803,15 +1873,15 @@ pub async fn run_tool_call_loop(
             if let Some(ref tx) = on_delta {
                 let secs = outcome.duration.as_secs();
                 let progress_msg = if outcome.success {
-                    format!("\u{2705} {} ({secs}s)\n", call.name)
+                    format!("[执行✓] {}（{secs}s）\n", call.name)
                 } else if let Some(ref reason) = outcome.error_reason {
                     format!(
-                        "\u{274c} {} ({secs}s): {}\n",
+                        "[执行✗] {}（{secs}s）: {}\n",
                         call.name,
                         truncate_with_ellipsis(reason, 200)
                     )
                 } else {
-                    format!("\u{274c} {} ({secs}s)\n", call.name)
+                    format!("[执行✗] {}（{secs}s）\n", call.name)
                 };
                 tracing::debug!(tool = %call.name, secs, "Sending progress complete to draft");
                 let _ = tx.send(StreamDelta::Status(progress_msg)).await;
@@ -2097,6 +2167,15 @@ pub async fn run(
     )?);
     tracing::info!(backend = mem.name(), "Memory initialized");
 
+    // ── Prompt cache (三级提示词匹配钩子) ─────────────────────────
+    // enabled=false 时返回 None；命中时绕过 provider 直接 dispatch 工具。
+    // 三层匹配 + 学习统一走 PromptCacheService（前端无关组件，CLI/channel/ACP 共用）。
+    let mut prompt_cache_svc =
+        crate::agent::prompt_cache_service::PromptCacheService::from_config(
+            &config.prompt_cache,
+            &config.string_match,
+        )?;
+
     // ── Peripherals (merge peripheral tools into registry) ─
     if !peripheral_overrides.is_empty() {
         tracing::info!(
@@ -2260,6 +2339,29 @@ pub async fn run(
         &model_name,
         &provider_runtime_options,
     )?;
+
+    // ── PromotionWorker: 后台扫 pending_rules → LLM 生成 regex → 验证 → 写 rules → reload L1 ──
+    // worker 由 PromptCacheService 持有（Drop 时 abort，绑定进程生命周期）；只在 learning_enabled
+    // 且 cache 启用时启动。给它单独造一份 provider（同 routing，便于和前台 turn 并行调云）。
+    // promotion_rx 在 REPL 每次提示符前 drain，把"🎓 已学到"提示打到 stdout。
+    if prompt_cache_svc.enabled() && config.prompt_cache.learning_enabled {
+        let worker_provider_box = zeroclaw_providers::create_routed_provider_with_options(
+            &provider_name,
+            fallback_provider_loop.and_then(|e| e.api_key.as_deref()),
+            fallback_provider_loop.and_then(|e| e.base_url.as_deref()),
+            &config.reliability,
+            &config.providers.model_routes,
+            &model_name,
+            &provider_runtime_options,
+        )?;
+        prompt_cache_svc.start_promotion_worker(
+            std::sync::Arc::from(worker_provider_box),
+            model_name.clone(),
+            config.prompt_cache.promote_poll_secs,
+            config.prompt_cache.promote_threshold_n,
+        );
+    }
+    let mut promotion_rx = prompt_cache_svc.subscribe_promotion();
 
     let model_switch_callback = get_model_switch_state();
 
@@ -2569,6 +2671,15 @@ pub async fn run(
 
         #[allow(unused_assignments)]
         let mut response = String::new();
+
+        // ── Prompt-cache 拦截（单条消息模式）：命中即返回，不走 provider ──
+        if let Some(out) =
+            prompt_cache_svc.try_dispatch(&effective_msg, &tools_registry).await
+        {
+            response = out;
+            history.push(ChatMessage::assistant(&response));
+            // 直接跳到 turn 收尾路径
+        } else {
         loop {
             match TOOL_LOOP_COST_TRACKING_CONTEXT
                 .scope(
@@ -2601,6 +2712,7 @@ pub async fn run(
                         None, // channel: CLI mode — uses prompt_cli
                         None, // receipt_generator
                         None, // collected_receipts
+                        None, // successful_tool_calls (V6)
                     ),
                 )
                 .await
@@ -2645,6 +2757,7 @@ pub async fn run(
                 }
             }
         }
+        }   // end else { /* run_tool_call_loop */ }
 
         // After successful multi-step execution, attempt autonomous skill creation.
         if config.skills.skill_creation.enabled {
@@ -2683,9 +2796,28 @@ pub async fn run(
             vec![ChatMessage::system(&system_prompt)]
         };
 
+        // V5: 自学习闭环跨 turn 状态——上一轮 L3 后写的 pending_rules id（如有），
+        // 本轮入口时用 process_regret 判定用户有没有反悔
+        let mut last_pending_id: Option<i64> = None;
+
         loop {
+            // 每轮提示符前 drain PromotionWorker 的"已学到"事件，给用户实时反馈。
+            // try_recv 不阻塞；channel 满或 lagged 都安全忽略（消息丢失 ≠ 学习失败）。
+            if let Some(rx) = promotion_rx.as_mut() {
+                while let Ok(ev) = rx.try_recv() {
+                    println!(
+                        "{}\"{}\" → {}（{:.1}s，下次走 L1 零 token）",
+                        zeroclaw_prompt_cache::log_tag("学会", "1;35"),
+                        ev.prompt,
+                        ev.tool_name,
+                        ev.elapsed_ms as f64 / 1000.0
+                    );
+                }
+            }
+
             print!("> ");
             let _ = std::io::stdout().flush();
+
 
             // Read raw bytes to avoid UTF-8 validation errors when PTY
             // transport splits multi-byte characters at frame boundaries
@@ -2853,6 +2985,8 @@ pub async fn run(
 
             let consumer_handle = tokio::spawn(async move {
                 use std::io::Write;
+                // 本轮回复是否已打过 [zeroclaw] 前缀（首个文本块前加一次，与上方日志噪声区分）。
+                let mut reply_prefixed = false;
                 while let Some(event) = delta_rx.recv().await {
                     match event {
                         StreamDelta::Status(text) => {
@@ -2865,6 +2999,15 @@ pub async fn run(
                         }
                         StreamDelta::Text(text) => {
                             content_streamed_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                            if !reply_prefixed {
+                                reply_prefixed = true;
+                                // 蓝色加粗 [zeroclaw] 标签（ANSI 1;34），TTY 才上色。
+                                if is_tty {
+                                    print!("\x1b[1;34m[zeroclaw]\x1b[0m ");
+                                } else {
+                                    print!("[zeroclaw] ");
+                                }
+                            }
                             print!("{text}");
                             let _ = std::io::stdout().flush();
                         }
@@ -2881,7 +3024,51 @@ pub async fn run(
                 }
             });
 
-            let response = loop {
+            // ── V5: 反悔检测——上一轮如果走了 L3 + record_learning，
+            //        本轮入口先看用户输入有没有反悔关键词
+            let mut regret_this_turn = false;
+            if let Some(pid) = last_pending_id {
+                if prompt_cache_svc
+                    .process_regret(pid, &effective_input, &config.prompt_cache.regret_keywords)
+                    .await
+                {
+                    println!("{}上一轮学习已撤销", zeroclaw_prompt_cache::log_tag("撤销", "1;31"));
+                    regret_this_turn = true;
+                } else {
+                    tracing::debug!(pending_id = pid, "本轮无反悔，pending confirmed");
+                }
+                last_pending_id = None; // 本轮已处理，下一轮无对照
+            }
+
+            // ── Prompt-cache 拦截（交互模式）：命中即直接出结果，不走 provider ──
+            // 反悔轮：用户只是撤销上一步学习，不再走本地匹配、不送大模型、不执行（见下方 response）。
+            let cached_response = if regret_this_turn {
+                None
+            } else {
+                prompt_cache_svc
+                    .try_dispatch(&effective_input, &tools_registry)
+                    .await
+            };
+            let from_cache_this_turn = cached_response.is_some(); // V5：决定要不要 record_learning
+
+            // V6 自学习：收集本轮**执行成功**的工具调用（失败的不收）。
+            let successful_tcs: std::sync::Mutex<Vec<(String, serde_json::Value)>> =
+                std::sync::Mutex::new(Vec::new());
+            let response = if regret_this_turn {
+                // 反悔轮：不送大模型、不执行、不学习，只确认撤销。
+                let ack = "好的，已撤销上一步学习；这次不重复执行。需要的话请重新说一下。";
+                let _ = delta_tx.send(DraftEvent::Text(format!("{ack}\n"))).await;
+                history.push(ChatMessage::assistant(ack));
+                String::new() // 留空 → 下方 record_learning 守卫的 !response.is_empty() 自动跳过学习
+            } else if let Some(out) = cached_response {
+                // 把结果用 streaming channel 推一下，UX 一致
+                let _ = delta_tx
+                    .send(DraftEvent::Text(format!("{out}\n")))
+                    .await;
+                // 命中场景下 run_tool_call_loop 没机会 push assistant，手动补
+                history.push(ChatMessage::assistant(&out));
+                out
+            } else { loop {
                 match TOOL_LOOP_COST_TRACKING_CONTEXT
                     .scope(
                         cost_tracking_context.clone(),
@@ -2913,6 +3100,7 @@ pub async fn run(
                             None, // channel: interactive CLI — uses prompt_cli
                             None, // receipt_generator
                             None, // collected_receipts
+                            Some(&successful_tcs), // V6 自学习：成功工具收集器
                         ),
                     )
                     .await
@@ -2997,7 +3185,17 @@ pub async fn run(
                         break String::new();
                     }
                 }
-            };
+            }};   // close `loop { ... }` and `else { ... }`
+
+            // ── V6: L3 路径才学习（cache 命中已能拦、反悔轮 response 为空，均不进来）。
+            //        学习的全部策略（override 跳过 / 空 prompt 跳过 / 调用次数!=1 跳过 / record_learning）
+            //        统一在 PromptCacheService::maybe_learn 里，CLI 与 channel 共用同一实现。
+            if !from_cache_this_turn && !response.is_empty() {
+                let collected = successful_tcs.into_inner().unwrap_or_default();
+                if let Some(pid) = prompt_cache_svc.maybe_learn(&effective_input, collected).await {
+                    last_pending_id = Some(pid);
+                }
+            }
 
             // Clean up: stop the Ctrl+C listener and flush streaming events.
             ctrlc_handle.abort();
@@ -4535,6 +4733,7 @@ mod tests {
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
+            None, // successful_tool_calls (V6)
         )
         .await
         .expect_err("provider without vision support should fail");
@@ -4593,6 +4792,7 @@ mod tests {
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
+            None, // successful_tool_calls (V6)
         )
         .await
         .expect_err("oversized payload must fail");
@@ -4645,6 +4845,7 @@ mod tests {
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
+            None, // successful_tool_calls (V6)
         )
         .await
         .expect("valid multimodal payload should pass");
@@ -4696,6 +4897,7 @@ mod tests {
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
+            None, // successful_tool_calls (V6)
         )
         .await
         .expect_err("should fail without vision_provider config");
@@ -4754,6 +4956,7 @@ mod tests {
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
+            None, // successful_tool_calls (V6)
         )
         .await
         .expect_err("should fail when vision provider cannot be created");
@@ -4812,6 +5015,7 @@ mod tests {
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
+            None, // successful_tool_calls (V6)
         )
         .await
         .expect("text-only messages should succeed with default provider");
@@ -4871,6 +5075,7 @@ mod tests {
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
+            None, // successful_tool_calls (V6)
         )
         .await
         .expect_err("should fail due to nonexistent vision provider");
@@ -4928,6 +5133,7 @@ mod tests {
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
+            None, // successful_tool_calls (V6)
         )
         .await
         .expect("empty image markers should not trigger vision routing");
@@ -4985,6 +5191,7 @@ mod tests {
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
+            None, // successful_tool_calls (V6)
         )
         .await
         .expect_err("should attempt vision provider creation for multiple images");
@@ -5125,6 +5332,7 @@ mod tests {
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
+            None, // successful_tool_calls (V6)
         )
         .await
         .expect("parallel execution should complete");
@@ -5205,6 +5413,7 @@ mod tests {
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
+            None, // successful_tool_calls (V6)
         )
         .await
         .expect("cron_add delivery defaults should be injected");
@@ -5277,6 +5486,7 @@ mod tests {
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
+            None, // successful_tool_calls (V6)
         )
         .await
         .expect("explicit delivery mode should be preserved");
@@ -5344,6 +5554,7 @@ mod tests {
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
+            None, // successful_tool_calls (V6)
         )
         .await
         .expect("loop should finish after deduplicating repeated calls");
@@ -5424,6 +5635,7 @@ mod tests {
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
+            None, // successful_tool_calls (V6)
         )
         .await
         .expect("non-interactive shell should succeed for low-risk command");
@@ -5494,6 +5706,7 @@ mod tests {
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
+            None, // successful_tool_calls (V6)
         )
         .await
         .expect("loop should finish with exempt tool executing twice");
@@ -5584,6 +5797,7 @@ mod tests {
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
+            None, // successful_tool_calls (V6)
         )
         .await
         .expect("loop should complete");
@@ -5648,6 +5862,7 @@ mod tests {
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
+            None, // successful_tool_calls (V6)
         )
         .await
         .expect("native fallback id flow should complete");
@@ -5739,6 +5954,7 @@ mod tests {
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
+            None, // successful_tool_calls (V6)
         )
         .await
         .expect("native tool-call text should be relayed through on_delta");
@@ -5757,7 +5973,7 @@ mod tests {
         assert!(
             deltas
                 .iter()
-                .any(|delta| matches!(delta, StreamDelta::Status(t) if t.starts_with("\u{1f4ac} Got 1 tool call(s)"))),
+                .any(|delta| matches!(delta, StreamDelta::Status(t) if t.starts_with("[大模型] 下发 1 个工具调用"))),
             "tool-call progress line should still be relayed"
         );
         assert!(
@@ -5807,6 +6023,7 @@ mod tests {
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
+            None, // successful_tool_calls (V6)
         )
         .await
         .expect("streaming provider should complete");
@@ -5878,6 +6095,7 @@ mod tests {
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
+            None, // successful_tool_calls (V6)
         )
         .await
         .expect("streaming tool loop should execute tool and finish");
@@ -5956,6 +6174,7 @@ mod tests {
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
+            None, // successful_tool_calls (V6)
         )
         .await
         .expect("native streaming events should preserve tool loop semantics");
@@ -6043,6 +6262,7 @@ mod tests {
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
+            None, // successful_tool_calls (V6)
         )
         .await
         .expect("routed streaming provider should complete");
@@ -7142,6 +7362,7 @@ Let me check the result."#;
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
+            None, // successful_tool_calls (V6)
         )
         .await
         .expect("tool loop should complete");
@@ -7165,10 +7386,10 @@ Let me check the result."#;
             "on_delta messages should include the tool failure reason, got: {all_deltas}"
         );
 
-        // Should also contain the cross mark (❌) icon to indicate failure.
+        // Should also contain the failure tag to indicate failure.
         assert!(
-            all_deltas.contains('\u{274c}'),
-            "on_delta messages should include ❌ for failed tool calls, got: {all_deltas}"
+            all_deltas.contains("[执行✗]"),
+            "on_delta messages should include [执行✗] for failed tool calls, got: {all_deltas}"
         );
 
         assert!(
@@ -7304,6 +7525,7 @@ Let me check the result."#;
                     None, // channel
                     None, // receipt_generator
                     None, // collected_receipts
+                    None, // successful_tool_calls (V6)
                 ),
             )
             .await
@@ -7392,6 +7614,7 @@ Let me check the result."#;
                     None, // channel
                     None, // receipt_generator
                     None, // collected_receipts
+                    None, // successful_tool_calls (V6)
                 ),
             )
             .await
@@ -7453,6 +7676,7 @@ Let me check the result."#;
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
+            None, // successful_tool_calls (V6)
         )
         .await
         .expect("should succeed without cost scope");

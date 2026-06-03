@@ -1,0 +1,22 @@
+[
+  { "prompt": "你好", "note": "纯打招呼，不对应任何工具" },
+  { "prompt": "你好啊", "note": "打招呼变体" },
+  { "prompt": "嗨", "note": "打招呼变体" },
+  { "prompt": "再见", "note": "纯告别" },
+  { "prompt": "拜拜", "note": "告别变体" },
+  { "prompt": "谢谢", "note": "客套" },
+  { "prompt": "好的", "note": "确认词，不该映射到 tool" },
+  { "prompt": "嗯", "note": "应答语" },
+  { "prompt": "你是谁", "note": "自我介绍询问" },
+  { "prompt": "你叫什么名字", "note": "自我介绍询问" },
+  { "prompt": "讲个笑话", "note": "娱乐请求，无对应工具" },
+  { "prompt": "讲个故事", "note": "娱乐请求" },
+  { "prompt": "什么是机器学习", "note": "概念问询" },
+  { "prompt": "解释一下量子力学", "note": "概念问询" },
+  { "prompt": "周末有什么计划", "note": "闲聊" },
+  { "prompt": "我们晚上去哪里吃饭", "note": "闲聊" },
+  { "prompt": "怎么写一个 hello world", "note": "技术求助" },
+  { "prompt": "Python 怎么读文件", "note": "技术求助" },
+  { "prompt": "今天心情不错", "note": "情感倾诉，不该触发任何 tool" },
+  { "prompt": "我有点累", "note": "情感倾诉" }
+]

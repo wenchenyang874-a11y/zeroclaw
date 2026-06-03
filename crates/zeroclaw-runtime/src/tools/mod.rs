@@ -38,7 +38,9 @@ pub mod sop_status;
 pub mod verifiable_intent;
 
 // Tool types from zeroclaw-tools (direct imports, no shims)
+pub use zeroclaw_tools::aidetect::AidetectTool;
 pub use zeroclaw_tools::ask_user::AskUserTool;
+pub use zeroclaw_tools::get_frame::GetFrameTool;
 pub use zeroclaw_tools::ask_user::ChannelMapHandle;
 pub use zeroclaw_tools::backup_tool::BackupTool;
 pub use zeroclaw_tools::browser::{BrowserTool, ComputerUseConfig};
@@ -376,6 +378,14 @@ pub fn all_tools_with_runtime(
         Arc::new(WeatherTool::new()),
         Arc::new(CanvasTool::new(canvas_store.unwrap_or_default())),
     ];
+
+    // aidetect / get_frame 条件注册：enabled=false 时不进工具表，LLM 看不到。
+    if root_config.aidetect.enabled {
+        tool_arcs.push(Arc::new(AidetectTool::new(root_config.aidetect.clone())));
+    }
+    if root_config.get_frame.enabled {
+        tool_arcs.push(Arc::new(GetFrameTool::new(root_config.get_frame.clone())));
+    }
 
     // Register discord_search if discord_history channel is configured
     if root_config.channels.discord_history.is_some() {
